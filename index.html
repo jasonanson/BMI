@@ -423,7 +423,7 @@
                             歷史紀錄
                         </h3>
                         <!-- 登入引導提示 -->
-                        <span id="login-hint" class="text-[10px] font-bold text-indigo-500 bg-indigo-50 px-2 py-0.5 rounded-full animate-pulse">
+                        <span id="login-hint" class="text-[10px] font-bold text-indigo-500 bg-indigo-50 px-2.5 py-1 rounded-full animate-pulse">
                             登入以永久保存
                         </span>
                     </div>
@@ -496,6 +496,7 @@
         let unsubscribeFirestore = null;
         let historyData = [];
         let chartInstance = null;
+        let isCloudActive = false; // 是否成功與 Firestore 同步之狀態標記
 
         // UI 綁定
         const dateOptions = { month: 'short', day: 'numeric', weekday: 'short' };
@@ -594,7 +595,6 @@
                 await signInWithPopup(auth, provider);
             } catch (error) {
                 console.error("Firebase Login Detailed Error:", error);
-                
                 const currentDomain = window.location.hostname;
                 
                 if (error.code === 'auth/unauthorized-domain') {
@@ -604,7 +604,7 @@
                         <div class="bg-rose-50 border border-rose-100 text-rose-600 font-mono font-bold text-sm p-3 rounded-xl select-all break-all text-center">
                             ${currentDomain}
                         </div>
-                        <p class="text-xs text-slate-500 mt-2">（💡 您可以點擊雙擊上方網址進行複製）</p>
+                        <p class="text-xs text-slate-500 mt-2">（💡 您可以雙擊上方網址進行複製）</p>
                         <div class="space-y-2 mt-4 text-xs">
                             <p class="font-bold text-slate-700">🛠️ 解決步驟：</p>
                             <ol class="list-decimal pl-4 space-y-1.5 text-slate-600">
@@ -628,7 +628,6 @@
                         error.message
                     );
                 } else if (error.code === 'auth/popup-closed-by-user') {
-                    // 使用者中途關閉視窗，無須大動作警告，僅在主控台提示
                     console.log("User closed login popup manually.");
                 } else {
                     showAuthErrorModal(
@@ -645,53 +644,74 @@
             await signOut(auth);
         });
 
+        // 本地暫存備援程序 (確保在連線失敗時各功能依然完美可用)
+        function loadLocalStorageMode() {
+            isCloudActive = false;
+            
+            // 將狀態徽章切換為備援本機標誌
+            const syncBadge = document.getElementById('sync-status');
+            syncBadge.className = "inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-50 text-amber-600 font-semibold text-xs tracking-widest uppercase mb-4 transition-colors duration-300";
+            document.getElementById('sync-icon').className = "ph-fill ph-hard-drive text-amber-500";
+            document.getElementById('sync-text').textContent = "本地暫存模式 (Local Backup)";
+            document.getElementById('login-hint').classList.remove('hidden');
+
+            historyData = JSON.parse(localStorage.getItem('premiumProBmiHistory')) || [];
+            renderHistory();
+            updateChart();
+        }
+
         // 監聽登入狀態，確保讀取路徑與 Firestore 安全規則完全吻合
         onAuthStateChanged(auth, async (user) => {
             currentUser = user;
             if (user && !user.isAnonymous) {
-                // 正式登入會員 (同步雲端並轉移舊資料)
+                // 正式登入會員 (嘗試同步雲端並轉移舊資料)
                 els.loginBtn.classList.add('hidden');
                 els.userInfo.classList.remove('hidden');
                 els.userInfo.classList.add('flex');
                 els.userAvatar.src = user.photoURL || '';
                 els.userName.textContent = user.displayName || 'User';
 
-                const syncBadge = document.getElementById('sync-status');
-                syncBadge.className = "inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-600 font-semibold text-xs tracking-widest uppercase mb-4 transition-colors duration-300";
-                document.getElementById('sync-icon').className = "ph-fill ph-cloud-check text-indigo-500 animate-bounce";
-                document.getElementById('sync-text').textContent = "雲端同步中 (Cloud)";
-                document.getElementById('login-hint').classList.add('hidden');
-
-                // 本地資料自動轉移遷移上雲協定 (符合安全規則 /users/{uid}/bmi_records)
-                try {
-                    const localData = JSON.parse(localStorage.getItem('premiumProBmiHistory')) || [];
-                    if (localData.length > 0) {
-                        const batch = writeBatch(db);
-                        localData.forEach(item => {
-                            const docRef = doc(collection(db, 'users', user.uid, 'bmi_records'));
-                            const itemToSave = { ...item };
-                            delete itemToSave.id;
-                            itemToSave.createdAt = serverTimestamp();
-                            batch.set(docRef, itemToSave);
-                        });
-                        await batch.commit();
-                        localStorage.removeItem('premiumProBmiHistory'); 
-                        console.log("Success: Migrated offline entries to cloud!");
-                    }
-                } catch (e) {
-                    console.error("Data migration failed:", e);
-                }
-                
-                // 訂閱安全路徑，在前端記憶體中排序（避免未設定複合索引導致載入失敗）
+                // 訂閱安全路徑，並於前端記憶體進行排序
                 const q = collection(db, 'users', user.uid, 'bmi_records');
                 if (unsubscribeFirestore) unsubscribeFirestore();
-                unsubscribeFirestore = onSnapshot(q, (snapshot) => {
+                
+                unsubscribeFirestore = onSnapshot(q, async (snapshot) => {
+                    isCloudActive = true; // 順利連線
+
+                    // 更新為雲端同步中狀態
+                    const syncBadge = document.getElementById('sync-status');
+                    syncBadge.className = "inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-600 font-semibold text-xs tracking-widest uppercase mb-4 transition-colors duration-300";
+                    document.getElementById('sync-icon').className = "ph-fill ph-cloud-check text-indigo-500 animate-bounce";
+                    document.getElementById('sync-text').textContent = "雲端同步中 (Cloud)";
+                    document.getElementById('login-hint').classList.add('hidden');
+
+                    // 1. 偵測並合併本地舊有資料上雲端
+                    try {
+                        const localData = JSON.parse(localStorage.getItem('premiumProBmiHistory')) || [];
+                        if (localData.length > 0) {
+                            const batch = writeBatch(db);
+                            localData.forEach(item => {
+                                const docRef = doc(collection(db, 'users', user.uid, 'bmi_records'));
+                                const itemToSave = { ...item };
+                                delete itemToSave.id;
+                                itemToSave.createdAt = serverTimestamp();
+                                batch.set(docRef, itemToSave);
+                            });
+                            await batch.commit();
+                            localStorage.removeItem('premiumProBmiHistory'); 
+                            console.log("Success: Migrated offline entries to cloud!");
+                        }
+                    } catch (e) {
+                        console.error("Data migration failed:", e);
+                    }
+
+                    // 2. 獲取並呈現雲端最新的歷史資料
                     historyData = [];
                     snapshot.forEach(docSnap => {
                         historyData.push({ id: docSnap.id, ...docSnap.data() });
                     });
 
-                    // 記憶體內排序 (避免未設定複合索引導致載入失敗)
+                    // 記憶體內排序 (完美取代 orderBy 以避免複合索引錯誤)
                     historyData.sort((a, b) => {
                         const timeA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : parseInt(a.id || 0);
                         const timeB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : parseInt(b.id || 0);
@@ -701,37 +721,37 @@
                     renderHistory();
                     updateChart();
                 }, (error) => {
+                    // 🚨 雲端讀取失敗 (如 rules 阻擋、未建立資料庫等)
                     console.error("Firestore listener error: ", error);
+                    isCloudActive = false;
+                    
+                    // 注入精美的連線失敗與智慧備援卡片
                     els.historyList.innerHTML = `
-                        <div class="p-5 bg-rose-50 border border-rose-100 rounded-2xl flex items-start gap-3 text-rose-600">
-                            <i class="ph-fill ph-warning-circle text-2xl mt-0.5"></i>
-                            <div>
-                                <h4 class="font-bold mb-1">雲端資料庫連線失敗</h4>
-                                <p class="text-xs font-medium leading-relaxed opacity-80">請確保您的 Firestore 設定為啟用狀態且規則無誤。</p>
+                        <div class="p-5 bg-rose-50 border border-rose-100 rounded-2xl flex flex-col gap-3.5 text-rose-600 fade-in-up">
+                            <div class="flex items-start gap-3">
+                                <i class="ph-fill ph-warning-circle text-2xl mt-0.5 shrink-0"></i>
+                                <div>
+                                    <h4 class="font-bold mb-1">雲端資料庫連線失敗</h4>
+                                    <p class="text-xs font-bold leading-relaxed mb-1">代碼: <span class="font-mono bg-rose-100 px-1.5 py-0.5 rounded text-[11px]">${error.code}</span></p>
+                                    <p class="text-[11px] font-semibold opacity-90 leading-relaxed">主因：您的 Firebase 專案尚未在控制台中「啟用 Cloud Firestore」或未部署正確的「安全規則 (Rules)」。</p>
+                                </div>
+                            </div>
+                            <div class="flex gap-2">
+                                <button id="btn-use-local" class="text-[11px] font-bold bg-white hover:bg-rose-100 text-rose-700 border border-rose-200 px-3 py-2 rounded-xl transition-all shadow-sm">
+                                    先使用本機暫存模式
+                                </button>
+                                <a href="https://console.firebase.google.com/" target="_blank" class="text-[11px] font-bold bg-rose-600 hover:bg-rose-700 text-white px-3 py-2 rounded-xl transition-all text-center flex items-center gap-1">
+                                    前往設定 <i class="ph-bold ph-arrow-square-out"></i>
+                                </a>
                             </div>
                         </div>`;
+                    
+                    // 綁定備援切換按鈕
+                    document.getElementById('btn-use-local').addEventListener('click', loadLocalStorageMode);
                 });
             } else {
-                // 訪客或未登入模式
-                els.loginBtn.classList.remove('hidden');
-                els.userInfo.classList.add('hidden');
-                els.userInfo.classList.remove('flex');
-
-                const syncBadge = document.getElementById('sync-status');
-                syncBadge.className = "inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 text-slate-500 font-semibold text-xs tracking-widest uppercase mb-4 transition-colors duration-300";
-                document.getElementById('sync-icon').className = "ph-fill ph-cloud-slash text-slate-400";
-                document.getElementById('sync-text').textContent = "未同步 (Local)";
-                document.getElementById('login-hint').classList.remove('hidden');
-
-                if (unsubscribeFirestore) {
-                    unsubscribeFirestore();
-                    unsubscribeFirestore = null;
-                }
-
-                // 讀取本機緩存
-                historyData = JSON.parse(localStorage.getItem('premiumProBmiHistory')) || [];
-                renderHistory();
-                updateChart();
+                // 訪客或未登入模式 -> 自動進入本地資料模式
+                loadLocalStorageMode();
             }
         });
 
@@ -879,7 +899,7 @@
             setTimeout(() => { els.indicator.style.left = `${pos}%`; }, 200);
         }
 
-        // 遵守安全儲存規則 (將資料導向符合 rules 的路徑)
+        // 智慧判斷：雲端正常則同步雲端，否則自動降級存於本地暫存
         async function saveRecord(weight, targetW, bmi, config) {
             const now = new Date();
             const record = {
@@ -893,24 +913,26 @@
             };
             
             const user = auth.currentUser;
-            if (user && !user.isAnonymous) {
+            if (user && !user.isAnonymous && isCloudActive) {
                 try {
                     record.createdAt = serverTimestamp();
                     await addDoc(collection(db, 'users', user.uid, 'bmi_records'), record);
                 } catch (err) {
-                    console.error("Cloud save failed:", err);
-                    els.error.innerHTML = `<i class="ph-fill ph-warning-circle text-lg"></i> 雲端存檔失敗，請確認資料庫權限！`;
-                    els.error.classList.remove('hidden');
+                    console.error("Cloud save failed, saving to local instead:", err);
+                    saveToLocalStorage(record);
                 }
             } else {
-                // 本地儲存備援
-                record.id = Date.now().toString();
-                historyData.push(record);
-                if (historyData.length > 30) historyData.shift();
-                localStorage.setItem('premiumProBmiHistory', JSON.stringify(historyData));
-                renderHistory();
-                updateChart();
+                saveToLocalStorage(record);
             }
+        }
+
+        function saveToLocalStorage(record) {
+            record.id = Date.now().toString();
+            historyData.push(record);
+            if (historyData.length > 30) historyData.shift();
+            localStorage.setItem('premiumProBmiHistory', JSON.stringify(historyData));
+            renderHistory();
+            updateChart();
         }
 
         function renderHistory() {
@@ -958,14 +980,14 @@
             });
         }
 
-        // 全域刪除機制
+        // 智慧判定：雲端正常則自雲端刪除，否則進行本地刪除
         window.deleteRecord = async function(id) {
             const user = auth.currentUser;
-            if (user && !user.isAnonymous) {
+            if (user && !user.isAnonymous && isCloudActive) {
                 try {
                     await deleteDoc(doc(db, 'users', user.uid, 'bmi_records', id));
                 } catch(e) { 
-                    console.error("Delete failed", e); 
+                    console.error("Cloud delete failed", e); 
                 }
             } else {
                 historyData = historyData.filter(i => i.id !== id);
@@ -975,9 +997,10 @@
             }
         };
 
+        // 智慧一鍵清除
         async function clearHistory() {
             const user = auth.currentUser;
-            if (user && !user.isAnonymous) {
+            if (user && !user.isAnonymous && isCloudActive) {
                 try {
                     const q = collection(db, 'users', user.uid, 'bmi_records');
                     const snapshot = await getDocs(q);
